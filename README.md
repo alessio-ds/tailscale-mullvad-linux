@@ -187,6 +187,78 @@ ip route show | grep tailscale
 
 ---
 
+## Arch Linux / systemd-networkd — reconnect-proof method (no firewalld)
+
+The Fedora method inserts rules into Mullvad's own `inet mullvad` table, which **Mullvad wipes on every reconnect**. On systems without NetworkManager the dispatcher script never fires either, so the fix silently breaks after the first reconnect. This variant survives reconnects, reboots, and Mullvad's **lockdown mode (kill switch)**.
+
+It works by:
+
+- A **separate** nftables table that stamps Mullvad's own exclusion mark (`ct mark 0x00000f41`) onto Tailscale traffic. Mullvad's permanent `ct mark 0x00000f41 accept` rule (present when connected *and* in lockdown) then lets it through. Because the table is independent of Mullvad's, it is never wiped on reconnect.
+- Setting **`rp_filter` to loose (`2`)** — without this, replies from Tailscale peers are silently dropped by strict reverse-path filtering once Mullvad's policy routing is active (symptom: traffic works one direction only).
+- Loading everything via a dedicated systemd unit after `tailscaled`.
+
+> This only sets `ct mark`, **not** `meta mark`/fwmark. Routing is handled by the explicit route below. Overwriting Tailscale's own `0x80000` fwmark breaks Tailscale's WireGuard handshake routing.
+
+**1. Firewall mark — `/etc/nftables.d/mullvad_tailscale.conf`**
+
+```
+#!/usr/sbin/nft -f
+table inet tsExclude
+delete table inet tsExclude
+table inet tsExclude {
+  chain overlayOut {
+    type filter hook output priority -151; policy accept;
+    ip daddr 100.64.0.0/10 ct mark set 0x00000f41
+    oifname "tailscale0" ct mark set 0x00000f41
+  }
+  chain overlayIn {
+    type filter hook input priority -151; policy accept;
+    ip saddr 100.64.0.0/10 ct mark set 0x00000f41
+    iifname "tailscale0" ct mark set 0x00000f41
+  }
+}
+```
+
+**2. Reverse-path filter — `/etc/sysctl.d/99-tailscale-rpfilter.conf`**
+
+```
+net.ipv4.conf.all.rp_filter=2
+net.ipv4.conf.default.rp_filter=2
+```
+
+**3. systemd unit — `/etc/systemd/system/tailscale-mullvad.service`**
+
+```
+[Unit]
+Description=Tailscale + Mullvad coexistence (firewall mark + route)
+After=tailscaled.service network-online.target
+Wants=tailscaled.service network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do ip link show tailscale0 >/dev/null 2>&1 && exit 0; sleep 1; done; exit 0'
+ExecStart=/usr/bin/nft -f /etc/nftables.d/mullvad_tailscale.conf
+ExecStart=/usr/bin/ip route replace 100.64.0.0/10 dev tailscale0
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable it:
+
+```
+sudo mkdir -p /etc/nftables.d
+sudo sysctl --system
+sudo systemctl daemon-reload
+sudo systemctl enable --now tailscale-mullvad.service
+```
+
+Do **not** enable the distro's generic `nftables.service` if you weren't already using it — on Arch it loads a default drop-policy ruleset that blocks inbound Tailscale.
+
+**Why it survives reconnect:** Mullvad re-creates its `ct mark 0x00000f41 accept` rules on every connect (and keeps them in lockdown mode). Since the `tsExclude` table only *marks* packets and lives outside Mullvad's table, Mullvad never touches it — the marked Tailscale traffic keeps passing.
+
+
 ## License
 
 MIT
